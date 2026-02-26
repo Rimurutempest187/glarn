@@ -1,34 +1,44 @@
 import os
+import re
 import shutil
 import asyncio
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any, Dict, List, Tuple
 
+import aiosqlite
 from dotenv import load_dotenv
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
     ConversationHandler,
-    filters,
+    MessageHandler,
+    ContextTypes,
     Defaults,
+    filters,
 )
 
-import db as dbm
-import keyboards as kb
-from utils import is_admin, safe_name, parse_type_token, clamp_int
+# =========================
+# CONFIG
+# =========================
 
-
-# --------- Conversation States ----------
-BC_WAIT_MESSAGE = 10
-RESTORE_WAIT_FILE = 20
-ALLCLEAR_CONFIRM = 30
+LEARNING_LANGS: List[Tuple[str, str]] = [
+    ("🇰🇷 KOREAN", "ko"),
+    ("🇯🇵 JAPANESE", "ja"),
+    ("🇺🇸 ENGLISH", "en"),
+]
+DEFAULT_UI_LANG = "my"          # UI/guide default Myanmar
+DEFAULT_LEARNING_LANG = "en"    # if user never chooses, fallback
+QUIZ_DIFFICULTIES = ("Basic", "Medium", "Hard")
 
 
 @dataclass(frozen=True)
@@ -37,65 +47,555 @@ class Cfg:
     admin_ids: set[int]
 
 
+# =========================
+# DB LAYER (SQLite / aiosqlite)
+# =========================
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+async def init_db(db_path: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA foreign_keys=ON;")
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                tg_lang TEXT,
+
+                learning_language TEXT DEFAULT 'en',
+                exp INTEGER DEFAULT 0,
+                level INTEGER DEFAULT 1,
+                quiz_difficulty TEXT DEFAULT 'Basic',
+
+                created_at TEXT NOT NULL,
+                last_active TEXT NOT NULL
+            );
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS learning_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                meta TEXT,
+                ts TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lang TEXT NOT NULL,         -- ko|ja|en
+                type TEXT NOT NULL,         -- AV|VOCA|GRAM
+                topic TEXT NOT NULL,        -- e.g. Numbers, Colors
+                level_tag TEXT,             -- optional: Basic/Unit1/Level2
+                html TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quiz_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lang TEXT NOT NULL,             -- ko|ja|en
+                difficulty TEXT NOT NULL,       -- Basic|Medium|Hard
+                level_tag TEXT,                 -- optional label
+                question TEXT NOT NULL,
+                option_a TEXT NOT NULL,
+                option_b TEXT NOT NULL,
+                option_c TEXT NOT NULL,
+                option_d TEXT NOT NULL,
+                correct_option TEXT NOT NULL,   -- A|B|C|D
+                explanation TEXT,
+                exp_reward INTEGER DEFAULT 10,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS quiz_sessions (
+                user_id INTEGER PRIMARY KEY,
+                question_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                FOREIGN KEY(question_id) REFERENCES quiz_questions(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+        await db.commit()
+
+
+async def upsert_user(cfg: Cfg, update: Update) -> None:
+    u = update.effective_user
+    if not u:
+        return
+
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,))
+        row = await cur.fetchone()
+        await cur.close()
+
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO users(user_id, username, first_name, tg_lang, learning_language, created_at, last_active)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    u.id,
+                    u.username,
+                    u.first_name,
+                    u.language_code,
+                    DEFAULT_LEARNING_LANG,
+                    now_iso(),
+                    now_iso(),
+                ),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE users
+                SET username=?, first_name=?, tg_lang=?, last_active=?
+                WHERE user_id=?
+                """,
+                (u.username, u.first_name, u.language_code, now_iso(), u.id),
+            )
+        await db.commit()
+
+
+async def log_action(cfg: Cfg, user_id: int, action: str, meta: Optional[str] = None) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            "INSERT INTO learning_logs(user_id, action, meta, ts) VALUES(?, ?, ?, ?)",
+            (user_id, action, meta, now_iso()),
+        )
+        await db.commit()
+
+
+async def get_user(cfg: Cfg, user_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return dict(row) if row else None
+
+
+async def set_learning_language(cfg: Cfg, user_id: int, lang: str) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            "UPDATE users SET learning_language=?, last_active=? WHERE user_id=?",
+            (lang, now_iso(), user_id),
+        )
+        await db.commit()
+
+
+async def set_quiz_difficulty(cfg: Cfg, user_id: int, difficulty: str) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            "UPDATE users SET quiz_difficulty=?, last_active=? WHERE user_id=?",
+            (difficulty, now_iso(), user_id),
+        )
+        await db.commit()
+
+
+async def add_exp(cfg: Cfg, user_id: int, amount: int) -> Tuple[int, int, bool]:
+    """
+    Returns: (exp, level, leveled_up)
+    Level rule: every 100 EXP => +1 level (level starts at 1)
+    """
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            "UPDATE users SET exp=exp+?, last_active=? WHERE user_id=?",
+            (amount, now_iso(), user_id),
+        )
+        await db.commit()
+
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT exp, level FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+
+        exp = int(row["exp"])
+        old_level = int(row["level"])
+        new_level = (exp // 100) + 1
+        leveled_up = new_level != old_level
+
+        if leveled_up:
+            await db.execute("UPDATE users SET level=? WHERE user_id=?", (new_level, user_id))
+            await db.commit()
+
+        return exp, new_level, leveled_up
+
+
+async def set_exp_absolute(cfg: Cfg, user_id: int, exp: int) -> None:
+    exp = max(0, exp)
+    level = (exp // 100) + 1
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            "UPDATE users SET exp=?, level=?, last_active=? WHERE user_id=?",
+            (exp, level, now_iso(), user_id),
+        )
+        await db.commit()
+
+
+async def list_contents(cfg: Cfg, lang: str, ctype: str) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT id, topic, level_tag
+            FROM contents
+            WHERE lang=? AND type=?
+            ORDER BY id DESC
+            """,
+            (lang, ctype),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [dict(r) for r in rows]
+
+
+async def get_content(cfg: Cfg, content_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM contents WHERE id=?", (content_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return dict(row) if row else None
+
+
+async def upsert_content(cfg: Cfg, lang: str, ctype: str, topic: str, html: str, level_tag: Optional[str]) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute(
+            "SELECT id FROM contents WHERE lang=? AND type=? AND topic=?",
+            (lang, ctype, topic),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+
+        if row is None:
+            await db.execute(
+                """
+                INSERT INTO contents(lang, type, topic, level_tag, html, created_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (lang, ctype, topic, level_tag, html, now_iso()),
+            )
+        else:
+            await db.execute(
+                "UPDATE contents SET level_tag=?, html=? WHERE id=?",
+                (level_tag, html, row[0]),
+            )
+        await db.commit()
+
+
+async def delete_contents_by_type(cfg: Cfg, ctype: str) -> int:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("DELETE FROM contents WHERE type=?", (ctype,))
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_quiz_all(cfg: Cfg) -> int:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("DELETE FROM quiz_questions")
+        await db.commit()
+        return cur.rowcount
+
+
+async def add_quiz_question(
+    cfg: Cfg,
+    lang: str,
+    difficulty: str,
+    level_tag: Optional[str],
+    question: str,
+    a: str,
+    b: str,
+    c: str,
+    d: str,
+    correct: str,
+    explanation: Optional[str],
+    reward: int,
+) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO quiz_questions(
+                lang, difficulty, level_tag, question,
+                option_a, option_b, option_c, option_d,
+                correct_option, explanation, exp_reward, created_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (lang, difficulty, level_tag, question, a, b, c, d, correct, explanation, reward, now_iso()),
+        )
+        await db.commit()
+
+
+async def get_random_quiz(cfg: Cfg, lang: str, difficulty: str) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT *
+            FROM quiz_questions
+            WHERE lang=? AND difficulty=?
+            ORDER BY RANDOM()
+            LIMIT 1
+            """,
+            (lang, difficulty),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return dict(row) if row else None
+
+
+async def get_quiz_by_id(cfg: Cfg, qid: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM quiz_questions WHERE id=?", (qid,))
+        row = await cur.fetchone()
+        await cur.close()
+        return dict(row) if row else None
+
+
+async def start_quiz_session(cfg: Cfg, user_id: int, qid: int) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO quiz_sessions(user_id, question_id, started_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                question_id=excluded.question_id,
+                started_at=excluded.started_at
+            """,
+            (user_id, qid, now_iso()),
+        )
+        await db.commit()
+
+
+async def get_quiz_session(cfg: Cfg, user_id: int) -> Optional[int]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("SELECT question_id FROM quiz_sessions WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row else None
+
+
+async def clear_quiz_session(cfg: Cfg, user_id: int) -> None:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        await db.execute("DELETE FROM quiz_sessions WHERE user_id=?", (user_id,))
+        await db.commit()
+
+
+async def top_users(cfg: Cfg, limit: int = 10) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT user_id, username, first_name, exp, level
+            FROM users
+            ORDER BY exp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [dict(r) for r in rows]
+
+
+async def all_user_ids(cfg: Cfg) -> List[int]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r[0]) for r in rows]
+
+
+async def stats(cfg: Cfg) -> Dict[str, int]:
+    async with aiosqlite.connect(cfg.db_path) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        total = int((await cur.fetchone())[0])
+        await cur.close()
+
+        db.row_factory = aiosqlite.Row
+        cur2 = await db.execute("SELECT last_active FROM users")
+        rows = await cur2.fetchall()
+        await cur2.close()
+
+    now = datetime.now(timezone.utc)
+    a24 = 0
+    a7 = 0
+    for r in rows:
+        try:
+            dt = datetime.fromisoformat(r["last_active"])
+        except Exception:
+            continue
+        if now - dt <= timedelta(hours=24):
+            a24 += 1
+        if now - dt <= timedelta(days=7):
+            a7 += 1
+
+    return {"total_users": total, "active_24h": a24, "active_7d": a7}
+
+
+# =========================
+# UI HELPERS
+# =========================
+
+def is_admin(cfg: Cfg, user_id: int) -> bool:
+    return user_id in cfg.admin_ids
+
+
+def safe_name(update: Update) -> str:
+    u = update.effective_user
+    if not u:
+        return "User"
+    if u.username:
+        return f"@{u.username}"
+    return (u.full_name or "User").strip()
+
+
+def progress_bar(exp: int, level: int) -> str:
+    prev_exp = (level - 1) * 100
+    next_exp = level * 100
+    in_level = exp - prev_exp
+    span = max(1, next_exp - prev_exp)
+    pct = max(0, min(100, int((in_level / span) * 100)))
+    filled = int(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    return f"{bar}  {in_level}/{span} ({pct}%)"
+
+
+def kb_learning_langs(prefix: str = "lang") -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}:{code}")] for name, code in LEARNING_LANGS]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_sections() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("A&V (ဗျည်း/သရ/ပေါင်းသံ)", callback_data="sec:AV")],
+            [InlineKeyboardButton("Voca (ဝေါဟာရ)", callback_data="sec:VOCA")],
+            [InlineKeyboardButton("Gram (သဒ္ဒါ)", callback_data="sec:GRAM")],
+        ]
+    )
+
+
+def kb_difficulty(current: Optional[str]) -> InlineKeyboardMarkup:
+    def btn(d: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(f"{d}{' ✅' if current == d else ''}", callback_data=f"diff:{d}")
+
+    return InlineKeyboardMarkup([[btn("Basic"), btn("Medium"), btn("Hard")]])
+
+
+def kb_content_list(items: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for it in items[:30]:
+        topic = it.get("topic", "Topic")
+        tag = it.get("level_tag")
+        label = f"{topic}" + (f" ({tag})" if tag else "")
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"content:{it['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_quiz_options(qid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("A", callback_data=f"ans:{qid}:A"),
+                InlineKeyboardButton("B", callback_data=f"ans:{qid}:B"),
+            ],
+            [
+                InlineKeyboardButton("C", callback_data=f"ans:{qid}:C"),
+                InlineKeyboardButton("D", callback_data=f"ans:{qid}:D"),
+            ],
+        ]
+    )
+
+
+def kb_admin_edit() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🌐 Choose Content Language (ko/ja/en)", callback_data="admin:choose_lang")],
+            [InlineKeyboardButton("➕ Add/Update A&V", callback_data="admin:add:AV")],
+            [InlineKeyboardButton("➕ Add/Update Voca", callback_data="admin:add:VOCA")],
+            [InlineKeyboardButton("➕ Add/Update Gram", callback_data="admin:add:GRAM")],
+            [InlineKeyboardButton("➕ Add Quiz Question", callback_data="admin:add:QUIZ")],
+            [InlineKeyboardButton("✅ Exit", callback_data="admin:exit")],
+        ]
+    )
+
+
 HELP_TEXT = (
-    "<b>🎓 Learner Commands</b>\n"
-    "• /start - ဘာသာစကားရွေး + လမ်းညွှန်\n"
-    "• /profile - Level/EXP/Progress\n"
-    "• /AandV - ဗျည်း/သရ/ပေါင်းသံ\n"
-    "• /voca - ဝေါဟာရ (category)\n"
-    "• /gram - သဒ္ဒါ\n"
-    "• /quiz - Quiz ဖြေ (EXP ရ)\n"
-    "• /cquiz - Quiz difficulty ပြောင်း\n"
-    "• /tops - Top learners\n"
+    "<b>🎓 Learner (User) Commands</b>\n"
+    "• /start - ဘာသာစကားရွေး + Bot သုံးပုံလမ်းညွှန်\n"
+    "• /profile - Level / EXP / Learning Progress\n"
+    "• /AandV - ဗျည်း၊ သရ၊ ပေါင်းစပ်သံ\n"
+    "• /voca - ဝေါဟာရ (Numbers, Colors, Fruits, ...)\n"
+    "• /gram - သဒ္ဒါတည်ဆောက်ပုံ\n"
+    "• /quiz - Quiz ဖြေ (ဖြေတိုင်း EXP ရ)\n"
+    "• /cquiz - Quiz difficulty ပြောင်း (Basic|Medium|Hard)\n"
+    "• /tops - ထိပ်တန်းလေ့လာသူများ\n"
     "• /help - ဒီစာမျက်နှာ\n\n"
     "<b>⚡️ Admin Commands</b>\n"
-    "• /edit - Content/Quiz ထည့်/ပြင်\n"
-    "• /giveexp &lt;id&gt; &lt;amount&gt;\n"
-    "• /broadcast - အားလုံးကို စာ/ပုံ ပို့\n"
+    "• /edit - Dashboard (Choose Language → Add Content/Quiz)\n"
+    "• /giveexp &lt;id&gt; &lt;amount&gt; - EXP သတ်မှတ်\n"
+    "• /broadcast - အားလုံးထံ စာ/ပုံ ပို့\n"
     "• /stats - Users/Active stats\n"
     "• /backup - DB backup ထုတ်\n"
     "• /restore - DB restore (file upload)\n"
     "• /allclear - Data အားလုံးဖျက်\n"
-    "• /delete &lt;type&gt; [lang]\n"
+    "• /delete &lt;type&gt; - AV|VOCA|GRAM|QUIZ ဖျက်\n"
 )
 
 
-def compute_progress(exp: int, level: int) -> str:
-    next_level_exp = level * 100
-    prev_level_exp = (level - 1) * 100
-    in_level = exp - prev_level_exp
-    span = next_level_exp - prev_level_exp
-    pct = int((in_level / span) * 100) if span > 0 else 0
-    pct = clamp_int(pct, 0, 100)
-    return f"{in_level}/{span} ({pct}%)"
+# =========================
+# CONVERSATION STATES
+# =========================
+
+EDIT_MENU, EDIT_WAIT_CONTENT, EDIT_WAIT_QUIZ = 10, 11, 12
+BROADCAST_WAIT = 20
+RESTORE_WAIT = 30
+ALLCLEAR_WAIT = 40
 
 
-async def ensure_user(cfg: Cfg, update: Update) -> None:
-    if not update.effective_user:
-        return
-    u = update.effective_user
-    await dbm.upsert_user(
-        cfg.db_path,
-        user_id=u.id,
-        username=u.username,
-        first_name=u.first_name,
-        tg_lang=u.language_code,
-    )
-
-
-# ---------------- Learner Commands ----------------
+# =========================
+# LEARNER COMMANDS
+# =========================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
     text = (
-        "<b>👋 Welcome to Learning Language Bot</b>\n\n"
-        "1) အောက်ကနေ သင်ယူမယ့် ဘာသာစကားကို ရွေးပါ\n"
-        "2) ပြီးရင် /AandV /voca /gram /quiz နဲ့ စတင်နိုင်ပါတယ်\n\n"
+        "<b>👋 Learning Language Bot မှ ကြိုဆိုပါတယ်</b>\n\n"
+        "<b>သင်ယူမယ့် ဘာသာစကားရွေးပါ</b> (Korean/Japanese/English)\n"
+        "ပြီးရင် အောက်ပါ command တွေနဲ့ စလုပ်နိုင်ပါတယ်👇\n\n"
+        "• /AandV • /voca • /gram • /quiz\n"
+        "• /profile • /tops • /help\n\n"
         "<i>Choose your learning language:</i>"
     )
-    await update.message.reply_text(text, reply_markup=kb.lang_keyboard())
+    await update.message.reply_text(text, reply_markup=kb_learning_langs(prefix="lang"))
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -104,119 +604,113 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    u = await dbm.get_user(cfg.db_path, update.effective_user.id)
+    u = await get_user(cfg, update.effective_user.id)
     if not u:
         await update.message.reply_text("Profile မတွေ့ပါ။ /start ကိုပြန်ခေါ်ပါ။")
         return
 
     exp = int(u["exp"])
     level = int(u["level"])
-    chosen = u.get("chosen_language", "en")
-    diff = u.get("quiz_difficulty", "Basic")
-
-    progress = compute_progress(exp, level)
+    lang = u.get("learning_language") or DEFAULT_LEARNING_LANG
+    diff = u.get("quiz_difficulty") or "Basic"
 
     text = (
         f"<b>👤 Profile</b>\n"
-        f"• Name: {safe_name(update.effective_user)}\n"
-        f"• Language: <code>{chosen}</code>\n"
+        f"• Name: <b>{safe_name(update)}</b>\n"
+        f"• Learning Language: <code>{lang}</code>\n"
         f"• Level: <b>{level}</b>\n"
         f"• EXP: <b>{exp}</b>\n"
-        f"• Progress to next level: <b>{progress}</b>\n"
+        f"• Progress: <b>{progress_bar(exp, level)}</b>\n"
         f"• Quiz Difficulty: <b>{diff}</b>\n"
     )
     await update.message.reply_text(text)
 
 
-async def _send_section_list(update: Update, context: ContextTypes.DEFAULT_TYPE, ctype: str) -> None:
+async def send_section(update: Update, context: ContextTypes.DEFAULT_TYPE, ctype: str) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    if not user:
-        await update.message.reply_text("User data မရှိသေးပါ။ /start ကိုပြန်ခေါ်ပါ။")
-        return
+    u = await get_user(cfg, update.effective_user.id)
+    lang = (u.get("learning_language") if u else None) or DEFAULT_LEARNING_LANG
 
-    lang = user.get("chosen_language", "en")
-    items = await dbm.list_contents(cfg.db_path, lang=lang, ctype=ctype)
-
+    items = await list_contents(cfg, lang=lang, ctype=ctype)
     if not items:
         await update.message.reply_text(
-            f"<b>{ctype}</b> အတွက် content မထည့်ထားသေးပါ။ Admin ကို /edit နဲ့ထည့်ခိုင်းပါ။"
+            f"<b>{ctype}</b> content မရှိသေးပါ။\nAdmin က /edit နဲ့ <code>{lang}</code> အတွက် ထည့်ပေးရပါမယ်။"
         )
         return
 
     title = {"AV": "A&V", "VOCA": "Voca", "GRAM": "Gram"}.get(ctype, ctype)
     await update.message.reply_text(
-        f"<b>📚 {title}</b>\nရွေးပြီးလေ့လာပါ 👇",
-        reply_markup=kb.content_list_keyboard(items),
+        f"<b>📚 {title}</b>\n(<code>{lang}</code>) ထဲက topic ကိုရွေးပါ👇",
+        reply_markup=kb_content_list(items),
     )
 
 
 async def cmd_aandv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_section_list(update, context, "AV")
+    await send_section(update, context, "AV")
 
 
 async def cmd_voca(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_section_list(update, context, "VOCA")
+    await send_section(update, context, "VOCA")
 
 
 async def cmd_gram(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send_section_list(update, context, "GRAM")
+    await send_section(update, context, "GRAM")
 
 
 async def cmd_cquiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    cur = user.get("quiz_difficulty", "Basic") if user else "Basic"
+    u = await get_user(cfg, update.effective_user.id)
+    current = (u.get("quiz_difficulty") if u else None) or "Basic"
     await update.message.reply_text(
-        "<b>🎯 Quiz Difficulty</b>\nရွေးပါ 👇",
-        reply_markup=kb.difficulty_keyboard(cur),
+        "<b>🎯 Quiz Difficulty</b>\nရွေးပါ👇",
+        reply_markup=kb_difficulty(current),
     )
 
 
 async def cmd_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    if not user:
+    u = await get_user(cfg, update.effective_user.id)
+    if not u:
         await update.message.reply_text("User data မရှိသေးပါ။ /start ကိုပြန်ခေါ်ပါ။")
         return
 
-    lang = user.get("chosen_language", "en")
-    difficulty = user.get("quiz_difficulty", "Basic")
+    lang = u.get("learning_language") or DEFAULT_LEARNING_LANG
+    diff = u.get("quiz_difficulty") or "Basic"
 
-    q = await dbm.get_random_quiz_question(cfg.db_path, lang=lang, difficulty=difficulty)
+    q = await get_random_quiz(cfg, lang=lang, difficulty=diff)
     if not q:
         await update.message.reply_text(
-            f"<b>Quiz</b> မေးခွန်းမရှိသေးပါ (<code>{lang}</code> / <b>{difficulty}</b>)။ Admin ကို /edit နဲ့ထည့်ခိုင်းပါ။"
+            f"<b>🧠 Quiz</b>\n(<code>{lang}</code> / <b>{diff}</b>) မေးခွန်းမရှိသေးပါ။\nAdmin က /edit နဲ့ Quiz ထည့်ပေးရပါမယ်။"
         )
         return
 
-    await dbm.start_quiz_session(cfg.db_path, update.effective_user.id, int(q["id"]))
+    await start_quiz_session(cfg, update.effective_user.id, int(q["id"]))
+    await log_action(cfg, update.effective_user.id, "quiz_start", f"qid={q['id']}")
 
     text = (
-        f"<b>🧠 Quiz ({difficulty})</b>\n\n"
+        f"<b>🧠 Quiz ({diff})</b>  <code>{lang}</code>\n\n"
         f"{q['question']}\n\n"
         f"<b>A)</b> {q['option_a']}\n"
         f"<b>B)</b> {q['option_b']}\n"
         f"<b>C)</b> {q['option_c']}\n"
         f"<b>D)</b> {q['option_d']}\n"
     )
-    await update.message.reply_text(text, reply_markup=kb.quiz_keyboard(int(q["id"])))
-    await dbm.log_action(cfg.db_path, update.effective_user.id, "quiz_start", f"qid={q['id']}")
+    await update.message.reply_text(text, reply_markup=kb_quiz_options(int(q["id"])))
 
 
 async def cmd_tops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    top = await dbm.get_top_users(cfg.db_path, limit=10)
+    top = await top_users(cfg, limit=10)
     if not top:
         await update.message.reply_text("Top list မရှိသေးပါ။")
         return
@@ -224,266 +718,338 @@ async def cmd_tops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["<b>🏆 Top Learners</b>"]
     for i, u in enumerate(top, start=1):
         name = u.get("username") or u.get("first_name") or str(u["user_id"])
-        lines.append(f"{i}. <b>{name}</b> — Lv {u['level']} | EXP {u['exp']}")
+        lines.append(f"{i}. <b>{name}</b> — Lv <b>{u['level']}</b> | EXP <b>{u['exp']}</b>")
     await update.message.reply_text("\n".join(lines))
 
 
-# ---------------- Callback Queries ----------------
+# =========================
+# CALLBACK HANDLER (Learner)
+# =========================
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
     q = update.callback_query
-    await q.answer()
+    if not q:
+        return
 
+    await q.answer()
     data = q.data or ""
 
-    # Language select
+    # User selects learning language
     if data.startswith("lang:"):
-        code = data.split(":", 1)[1].strip()
-        await ensure_user(cfg, update)
-        await dbm.set_user_language(cfg.db_path, q.from_user.id, code)
-        await dbm.log_action(cfg.db_path, q.from_user.id, "set_language", code)
+        lang = data.split(":", 1)[1].strip()
+        if lang not in {"ko", "ja", "en"}:
+            await q.edit_message_text("Language မမှန်ပါ။ /start ကိုပြန်ခေါ်ပါ။")
+            return
+
+        await upsert_user(cfg, update)
+        await set_learning_language(cfg, q.from_user.id, lang)
+        await log_action(cfg, q.from_user.id, "set_learning_language", lang)
 
         await q.edit_message_text(
-            f"<b>✅ Language set:</b> <code>{code}</code>\n\n"
-            "Commands:\n"
+            "<b>✅ ရွေးချယ်ပြီးပါပြီ</b>\n"
+            f"Learning Language: <code>{lang}</code>\n\n"
+            "စတင်နိုင်တဲ့ command တွေ👇\n"
             "• /AandV • /voca • /gram • /quiz\n"
             "• /profile • /tops • /help"
         )
         return
 
-    # Difficulty set
+    # Difficulty selection
     if data.startswith("diff:"):
         diff = data.split(":", 1)[1].strip()
-        await dbm.set_quiz_difficulty(cfg.db_path, q.from_user.id, diff)
-        await dbm.log_action(cfg.db_path, q.from_user.id, "set_difficulty", diff)
+        if diff not in QUIZ_DIFFICULTIES:
+            return
+        await set_quiz_difficulty(cfg, q.from_user.id, diff)
+        await log_action(cfg, q.from_user.id, "set_quiz_difficulty", diff)
         await q.edit_message_text(f"<b>✅ Quiz difficulty set:</b> <b>{diff}</b>")
         return
 
-    # Content view
+    # View content detail
     if data.startswith("content:"):
-        content_id = int(data.split(":", 1)[1])
-        item = await dbm.get_content_by_id(cfg.db_path, content_id)
+        cid = int(data.split(":", 1)[1])
+        item = await get_content(cfg, cid)
         if not item:
             await q.edit_message_text("Content မတွေ့ပါ။")
             return
+
         title = {"AV": "A&V", "VOCA": "Voca", "GRAM": "Gram"}.get(item["type"], item["type"])
-        head = f"<b>📌 {title}: {item['key']}</b>"
+        head = f"<b>📌 {title}: {item['topic']}</b>"
         if item.get("level_tag"):
             head += f" <i>({item['level_tag']})</i>"
-        await q.edit_message_text(head + "\n\n" + item["html"])
-        await dbm.log_action(cfg.db_path, q.from_user.id, "view_content", f"id={content_id}")
+        head += f"\n<code>{item['lang']}</code>\n\n"
+        await q.edit_message_text(head + item["html"])
+        await log_action(cfg, q.from_user.id, "view_content", f"id={cid}")
         return
 
     if data == "back:home":
-        await q.edit_message_text("<b>Home</b>\nရွေးစရာတွေ👇\n• /AandV • /voca • /gram • /quiz • /profile", reply_markup=None)
+        await q.edit_message_text(
+            "<b>🏠 Home</b>\n"
+            "ရွေးစရာ commands👇\n"
+            "• /AandV • /voca • /gram • /quiz • /profile"
+        )
         return
 
     # Quiz answer
-    if data.startswith("q:"):
-        parts = data.split(":")
-        qid = int(parts[1])
-        opt = parts[2].strip().upper()
+    if data.startswith("ans:"):
+        _, qid_s, opt = data.split(":")
+        qid = int(qid_s)
+        opt = opt.strip().upper()
 
-        session_qid = await dbm.get_quiz_session(cfg.db_path, q.from_user.id)
+        session_qid = await get_quiz_session(cfg, q.from_user.id)
         if session_qid != qid:
             await q.edit_message_text("Session မကိုက်ညီပါ။ /quiz ကိုပြန်ခေါ်ပါ။")
             return
 
-        # fetch question
-        # (simple fetch via random function won't work; use direct SQL here by reusing random getter logic)
-        import aiosqlite
-        async with aiosqlite.connect(cfg.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cur = await db.execute("SELECT * FROM quiz_questions WHERE id=?", (qid,))
-            row = await cur.fetchone()
-            await cur.close()
-
-        if not row:
+        qq = await get_quiz_by_id(cfg, qid)
+        if not qq:
             await q.edit_message_text("Question မတွေ့ပါ။")
-            await dbm.clear_quiz_session(cfg.db_path, q.from_user.id)
+            await clear_quiz_session(cfg, q.from_user.id)
             return
 
-        correct = row["correct_option"].upper()
-        explanation = row["explanation"]
-        reward_correct = int(row["exp_reward"] or 10)
-        reward_wrong = 3  # requirement: "ဖြေဆိုပြီးတိုင်း EXP ရရှိ" → အမှားလည်း နည်းနည်းရ
+        correct = (qq["correct_option"] or "").strip().upper()
+        explanation = qq.get("explanation")
+        reward_correct = int(qq.get("exp_reward") or 10)
 
-        is_right = (opt == correct)
+        # Requirement: "ဖြေဆိုပြီးတိုင်း EXP ရ" => wrong လည်း အနည်းငယ်ရ
+        reward_wrong = 3
+
+        is_right = opt == correct
         gained = reward_correct if is_right else reward_wrong
 
-        stats = await dbm.add_exp(cfg.db_path, q.from_user.id, gained)
-        await dbm.clear_quiz_session(cfg.db_path, q.from_user.id)
-        await dbm.log_action(cfg.db_path, q.from_user.id, "quiz_answer", f"qid={qid},opt={opt},correct={correct}")
+        exp, level, leveled_up = await add_exp(cfg, q.from_user.id, gained)
+        await clear_quiz_session(cfg, q.from_user.id)
+        await log_action(cfg, q.from_user.id, "quiz_answer", f"qid={qid},opt={opt},correct={correct}")
 
         msg = "<b>✅ Correct!</b>" if is_right else f"<b>❌ Wrong!</b> (Correct: <b>{correct}</b>)"
-        msg += f"\n• Gained EXP: <b>+{gained}</b>\n• Level: <b>{stats['level']}</b> | EXP: <b>{stats['exp']}</b>"
+        msg += f"\n• EXP +<b>{gained}</b>\n• Level: <b>{level}</b> | EXP: <b>{exp}</b>"
+        if leveled_up:
+            msg += "\n\n<b>🎉 Level Up!</b> ဆက်လေ့လာကြရအောင်!"
         if explanation:
             msg += f"\n\n<b>📌 Explanation</b>\n{explanation}"
 
         await q.edit_message_text(msg)
         return
 
-    # Admin panel callbacks handled in /edit conversation (optional)
-    if data.startswith("admin:"):
-        await q.answer("Use /edit command.")
-        return
 
+# =========================
+# ADMIN: /edit DASHBOARD (Conversation)
+# =========================
 
-# ---------------- Admin Commands ----------------
-
-async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def edit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
+    if not is_admin(cfg, update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
-        return
+        return ConversationHandler.END
 
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    cur_lang = user.get("chosen_language", "en") if user else "en"
+    # default edit language (content language) - keep in session
+    if "edit_lang" not in context.user_data:
+        context.user_data["edit_lang"] = "en"
 
+    lang = context.user_data["edit_lang"]
     text = (
-        "<b>🛠 Admin Edit Dashboard</b>\n\n"
-        f"Current language: <code>{cur_lang}</code>\n\n"
-        "<b>How to use</b>\n"
-        "1) /start မှာ language ရွေးထားတာကို Admin language အဖြစ်သုံးမယ်\n"
-        "2) Content ထည့်ရန်\n"
-        "   - A&V/Voca/Gram: button နှိပ်ပြီး template အတိုင်း စာပို့\n"
-        "   - Quiz: Quiz template အတိုင်း စာပို့\n\n"
-        "<i>Choose:</i>"
+        "<b>🛠 Admin Dashboard</b>\n\n"
+        f"Current Content Language: <code>{lang}</code>\n\n"
+        "<b>လုပ်ပုံလုပ်နည်း</b>\n"
+        "1) Choose Content Language (ko/ja/en)\n"
+        "2) Add/Update A&V / Voca / Gram / Quiz\n\n"
+        "<i>ရွေးပါ👇</i>"
     )
-    await update.message.reply_text(text, reply_markup=kb.admin_edit_keyboard())
+    await update.message.reply_text(text, reply_markup=kb_admin_edit())
+    return EDIT_MENU
 
 
-async def admin_add_content_template(update: Update, context: ContextTypes.DEFAULT_TYPE, ctype: str) -> int:
+async def edit_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cfg: Cfg = context.bot_data["cfg"]
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
+    q = update.callback_query
+    if not q:
+        return EDIT_MENU
+    await q.answer()
+
+    if not is_admin(cfg, q.from_user.id):
+        await q.edit_message_text("⛔ Admin only.")
         return ConversationHandler.END
 
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    lang = user.get("chosen_language", "en") if user else "en"
+    data = q.data or ""
 
-    if ctype != "QUIZ":
-        context.user_data["admin_add_type"] = ctype
-        await update.message.reply_text(
-            "<b>🧩 Add/Update Content</b>\n\n"
-            f"Language: <code>{lang}</code>\n"
-            f"Type: <b>{ctype}</b>\n\n"
-            "အောက်က Template အတိုင်းပို့ပါ (HTML allowed):\n\n"
-            "<code>"
-            "KEY: Numbers\n"
-            "LEVEL: Basic   (optional)\n"
-            "HTML:\n"
-            "<b>Numbers</b><br/>\n"
-            "1 = one<br/>\n"
-            "2 = two\n"
-            "</code>\n\n"
-            "ပို့ပြီးတာနဲ့ auto save လုပ်ပေးမယ်။"
+    if data == "admin:exit":
+        await q.edit_message_text("✅ Admin dashboard closed.")
+        return ConversationHandler.END
+
+    if data == "admin:choose_lang":
+        await q.edit_message_text(
+            "<b>🌐 Choose Content Language</b>\n"
+            "အောက်ကမှ ရွေးပါ👇",
+            reply_markup=kb_learning_langs(prefix="adminlang"),
         )
-        return BC_WAIT_MESSAGE
+        return EDIT_MENU
 
-    # QUIZ template
-    context.user_data["admin_add_type"] = "QUIZ"
-    await update.message.reply_text(
-        "<b>🧠 Add Quiz Question</b>\n\n"
-        f"Language: <code>{lang}</code>\n\n"
-        "Template အတိုင်းပို့ပါ:\n\n"
-        "<code>"
-        "DIFFICULTY: Basic\n"
-        "QUESTION: What is the color of the sky?\n"
-        "A: Blue\n"
-        "B: Green\n"
-        "C: Red\n"
-        "D: Yellow\n"
-        "CORRECT: A\n"
-        "EXPLANATION: Usually the sky looks blue.\n"
-        "REWARD: 10\n"
-        "</code>\n"
-    )
-    return BC_WAIT_MESSAGE
+    if data.startswith("adminlang:"):
+        lang = data.split(":", 1)[1].strip()
+        if lang not in {"ko", "ja", "en"}:
+            return EDIT_MENU
+        context.user_data["edit_lang"] = lang
+        await q.edit_message_text(
+            f"<b>✅ Content Language Set:</b> <code>{lang}</code>\n\n"
+            "ဆက်လုပ်ရန် /edit ကိုပြန်ခေါ်လည်းရပါတယ် (သို့) အပေါ်က dashboard message ကိုအသုံးပြုပါ။"
+        )
+        return ConversationHandler.END
+
+    if data.startswith("admin:add:"):
+        ctype = data.split(":", 2)[2].strip()
+        lang = context.user_data.get("edit_lang", "en")
+
+        if ctype in {"AV", "VOCA", "GRAM"}:
+            context.user_data["pending_add_type"] = ctype
+            await q.edit_message_text(
+                "<b>➕ Add/Update Content</b>\n\n"
+                f"Language: <code>{lang}</code>\n"
+                f"Type: <b>{ctype}</b>\n\n"
+                "Template အတိုင်း message တစ်ခုတည်းနဲ့ ပို့ပါ (HTML allowed):\n\n"
+                "<code>"
+                "TOPIC: Numbers\n"
+                "LEVEL: Basic   (optional)\n"
+                "HTML:\n"
+                "<b>Numbers</b><br/>\n"
+                "1 = one<br/>\n"
+                "2 = two\n"
+                "</code>\n\n"
+                "Cancel: /cancel"
+            )
+            return EDIT_WAIT_CONTENT
+
+        if ctype == "QUIZ":
+            context.user_data["pending_add_type"] = "QUIZ"
+            await q.edit_message_text(
+                "<b>➕ Add Quiz Question</b>\n\n"
+                f"Language: <code>{lang}</code>\n\n"
+                "Template အတိုင်းပို့ပါ:\n\n"
+                "<code>"
+                "DIFFICULTY: Basic\n"
+                "LEVEL: Unit1   (optional)\n"
+                "QUESTION: What is ...?\n"
+                "A: ...\n"
+                "B: ...\n"
+                "C: ...\n"
+                "D: ...\n"
+                "CORRECT: A\n"
+                "EXPLANATION: ... (optional)\n"
+                "REWARD: 10\n"
+                "</code>\n\n"
+                "Cancel: /cancel"
+            )
+            return EDIT_WAIT_QUIZ
+
+    return EDIT_MENU
 
 
-async def admin_parse_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def _extract_field(text: str, key: str) -> Optional[str]:
+    # Match "KEY: value" (case-insensitive), first occurrence
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+    m = pattern.search(text)
+    return m.group(1).strip() if m else None
+
+
+def _extract_block_after(text: str, marker: str) -> str:
+    # Get everything after a line "MARKER:" (case-insensitive)
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().upper() == f"{marker.upper()}:":
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    return "\n".join(lines[start:]).strip()
+
+
+async def edit_receive_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cfg: Cfg = context.bot_data["cfg"]
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
+    if not is_admin(cfg, update.effective_user.id):
         return ConversationHandler.END
 
-    msg = update.message
-    text = msg.text or ""
-    add_type: Optional[str] = context.user_data.get("admin_add_type")
-    user = await dbm.get_user(cfg.db_path, update.effective_user.id)
-    lang = user.get("chosen_language", "en") if user else "en"
+    text = update.message.text or ""
+    lang = context.user_data.get("edit_lang", "en")
+    ctype = context.user_data.get("pending_add_type")
 
-    if not add_type:
-        await msg.reply_text("State မမှန်ပါ။ /edit ကိုပြန်စပါ။")
+    if ctype not in {"AV", "VOCA", "GRAM"}:
+        await update.message.reply_text("State မမှန်ပါ။ /edit ကိုပြန်စပါ။")
         return ConversationHandler.END
 
-    def get_field(prefix: str) -> Optional[str]:
-        for line in text.splitlines():
-            if line.strip().upper().startswith(prefix.upper() + ":"):
-                return line.split(":", 1)[1].strip()
-        return None
+    topic = _extract_field(text, "TOPIC")
+    level_tag = _extract_field(text, "LEVEL")
+    html = _extract_block_after(text, "HTML")
 
-    if add_type in {"AV", "VOCA", "GRAM"}:
-        key = get_field("KEY")
-        level_tag = get_field("LEVEL")
-        html_idx = None
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip().upper() == "HTML:":
-                html_idx = i + 1
-                break
-        html = "\n".join(lines[html_idx:]).strip() if html_idx is not None else ""
+    if not topic or not html:
+        await update.message.reply_text("❌ TOPIC နှင့် HTML မပြည့်စုံပါ။ Template အတိုင်းပြန်ပို့ပါ။")
+        return EDIT_WAIT_CONTENT
 
-        if not key or not html:
-            await msg.reply_text("❌ KEY နှင့် HTML မပါ/မမှန်ပါ။ Template အတိုင်းပြန်ပို့ပါ။")
-            return BC_WAIT_MESSAGE
+    await upsert_content(cfg, lang=lang, ctype=ctype, topic=topic, html=html, level_tag=level_tag)
+    await log_action(cfg, update.effective_user.id, "admin_upsert_content", f"{lang}/{ctype}/{topic}")
 
-        await dbm.upsert_content(cfg.db_path, lang=lang, ctype=add_type, key=key, html=html, level_tag=level_tag)
-        await dbm.log_action(cfg.db_path, update.effective_user.id, "admin_upsert_content", f"{lang}/{add_type}/{key}")
-        await msg.reply_text(f"✅ Saved: <code>{lang}</code> / <b>{add_type}</b> / <b>{key}</b>\n/edit နဲ့ ဆက်လုပ်နိုင်ပါတယ်။")
-        return ConversationHandler.END
-
-    if add_type == "QUIZ":
-        difficulty = (get_field("DIFFICULTY") or "Basic").title()
-        question = get_field("QUESTION")
-        a = get_field("A")
-        b = get_field("B")
-        c = get_field("C")
-        d = get_field("D")
-        correct = (get_field("CORRECT") or "").strip().upper()
-        explanation = get_field("EXPLANATION")
-        reward_s = get_field("REWARD") or "10"
-
-        if difficulty not in {"Basic", "Medium", "Hard"}:
-            await msg.reply_text("❌ DIFFICULTY must be Basic|Medium|Hard")
-            return BC_WAIT_MESSAGE
-
-        if not all([question, a, b, c, d]) or correct not in {"A", "B", "C", "D"}:
-            await msg.reply_text("❌ Fields မပြည့်စုံပါ။ Template အတိုင်းပြန်ပို့ပါ။")
-            return BC_WAIT_MESSAGE
-
-        try:
-            reward = int(reward_s)
-        except Exception:
-            reward = 10
-
-        await dbm.add_quiz_question(cfg.db_path, lang, difficulty, question, a, b, c, d, correct, explanation, reward)
-        await dbm.log_action(cfg.db_path, update.effective_user.id, "admin_add_quiz", f"{lang}/{difficulty}")
-        await msg.reply_text("✅ Quiz question saved.\n/edit နဲ့ ဆက်လုပ်နိုင်ပါတယ်။")
-        return ConversationHandler.END
-
-    await msg.reply_text("Unknown admin add type.")
+    await update.message.reply_text(
+        f"✅ Saved!\nLanguage: <code>{lang}</code>\nType: <b>{ctype}</b>\nTopic: <b>{topic}</b>\n\n/edit နဲ့ ဆက်လုပ်နိုင်ပါတယ်။"
+    )
     return ConversationHandler.END
 
 
+async def edit_receive_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Cfg = context.bot_data["cfg"]
+    if not is_admin(cfg, update.effective_user.id):
+        return ConversationHandler.END
+
+    text = update.message.text or ""
+    lang = context.user_data.get("edit_lang", "en")
+
+    diff = (_extract_field(text, "DIFFICULTY") or "Basic").title()
+    level_tag = _extract_field(text, "LEVEL")
+    question = _extract_field(text, "QUESTION")
+    a = _extract_field(text, "A")
+    b = _extract_field(text, "B")
+    c = _extract_field(text, "C")
+    d = _extract_field(text, "D")
+    correct = (_extract_field(text, "CORRECT") or "").strip().upper()
+    explanation = _extract_field(text, "EXPLANATION")
+    reward_s = _extract_field(text, "REWARD") or "10"
+
+    if diff not in QUIZ_DIFFICULTIES:
+        await update.message.reply_text("❌ DIFFICULTY must be Basic | Medium | Hard")
+        return EDIT_WAIT_QUIZ
+
+    if not all([question, a, b, c, d]) or correct not in {"A", "B", "C", "D"}:
+        await update.message.reply_text("❌ Field မပြည့်စုံပါ။ Template အတိုင်းပြန်ပို့ပါ။")
+        return EDIT_WAIT_QUIZ
+
+    try:
+        reward = int(reward_s)
+    except Exception:
+        reward = 10
+
+    await add_quiz_question(cfg, lang, diff, level_tag, question, a, b, c, d, correct, explanation, reward)
+    await log_action(cfg, update.effective_user.id, "admin_add_quiz", f"{lang}/{diff}")
+
+    await update.message.reply_text(
+        f"✅ Quiz question saved!\nLanguage: <code>{lang}</code>\nDifficulty: <b>{diff}</b>\n\n/edit နဲ့ ဆက်လုပ်နိုင်ပါတယ်။"
+    )
+    return ConversationHandler.END
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+# =========================
+# ADMIN COMMANDS
+# =========================
+
 async def cmd_giveexp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
+    if not is_admin(cfg, update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -497,196 +1063,40 @@ async def cmd_giveexp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ id/amount must be integer.")
         return
 
-    user = await dbm.get_user(cfg.db_path, uid)
-    if not user:
+    u = await get_user(cfg, uid)
+    if not u:
         await update.message.reply_text("User မတွေ့ပါ။")
         return
 
-    new_exp = max(0, int(user["exp"]) + amount)
-    await dbm.set_exp(cfg.db_path, uid, new_exp)
-    await dbm.log_action(cfg.db_path, update.effective_user.id, "admin_giveexp", f"to={uid},amount={amount}")
-    await update.message.reply_text(f"✅ Updated user <code>{uid}</code> EXP to <b>{new_exp}</b>.")
+    new_exp = max(0, int(u["exp"]) + amount)
+    await set_exp_absolute(cfg, uid, new_exp)
+    await log_action(cfg, update.effective_user.id, "admin_giveexp", f"to={uid},amount={amount}")
+    await update.message.reply_text(f"✅ Updated <code>{uid}</code> EXP => <b>{new_exp}</b>")
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
+    await upsert_user(cfg, update)
 
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    st = await dbm.get_stats(cfg.db_path)
-    await update.message.reply_text(
-        "<b>📊 Stats</b>\n"
-        f"• Total users: <b>{st['total_users']}</b>\n"
-        f"• Active (24h): <b>{st['active_24h']}</b>\n"
-        f"• Active (7d): <b>{st['active_7d']}</b>\n"
-    )
-
-
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
-
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /delete <type> [lang]\nTypes: AV | VOCA | GRAM | QUIZ")
-        return
-
-    ctype = parse_type_token(context.args[0])
-    lang = context.args[1] if len(context.args) >= 2 else None
-
-    if not ctype:
-        await update.message.reply_text("❌ Unknown type. Use: AV|VOCA|GRAM|QUIZ")
-        return
-
-    if ctype == "QUIZ":
-        n = await dbm.delete_quiz(cfg.db_path, lang=lang)
-        await update.message.reply_text(f"✅ Deleted quiz questions: <b>{n}</b>" + (f" for <code>{lang}</code>" if lang else " (all languages)"))
-        return
-
-    n = await dbm.delete_content_type(cfg.db_path, ctype=ctype, lang=lang)
-    await update.message.reply_text(f"✅ Deleted contents: <b>{n}</b>" + (f" for <code>{lang}</code>" if lang else " (all languages)"))
-
-
-async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
-
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    src = cfg.db_path
-    if not os.path.exists(src):
-        await update.message.reply_text("DB file မတွေ့ပါ။")
-        return
-
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    backup_name = f"backup_{ts}.sqlite3"
-    os.makedirs("backups", exist_ok=True)
-    dst = os.path.join("backups", backup_name)
-
-    def _copy() -> None:
-        shutil.copy2(src, dst)
-
-    await asyncio.to_thread(_copy)
-    await update.message.reply_document(document=open(dst, "rb"), filename=backup_name, caption="✅ Backup created.")
-
-
-async def cmd_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
-
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "<b>♻️ Restore</b>\n"
-        "SQLite DB file (.sqlite3) ကို upload လုပ်ပါ။\n"
-        "⚠️ Restore လုပ်တာနဲ့ အဟောင်း DB ကို အရင် backup တစ်份 ထုတ်ပြီး အစားထိုးပါမယ်။"
-    )
-    return RESTORE_WAIT_FILE
-
-
-async def cmd_restore_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg: Cfg = context.bot_data["cfg"]
-
-    doc = update.message.document
-    if not doc:
-        await update.message.reply_text("DB file upload လုပ်ပါ။")
-        return RESTORE_WAIT_FILE
-
-    if not (doc.file_name or "").endswith((".sqlite3", ".db", ".sqlite")):
-        await update.message.reply_text("❌ File type မမှန်ပါ။ .sqlite3/.db/.sqlite ဖြစ်ရမယ်။")
-        return RESTORE_WAIT_FILE
-
-    os.makedirs("restore_tmp", exist_ok=True)
-    tmp_path = os.path.join("restore_tmp", doc.file_name)
-
-    file = await doc.get_file()
-    await file.download_to_drive(custom_path=tmp_path)
-
-    # backup current
-    if os.path.exists(cfg.db_path):
-        os.makedirs("backups", exist_ok=True)
-        bak_path = os.path.join("backups", "pre_restore_backup.sqlite3")
-        shutil.copy2(cfg.db_path, bak_path)
-
-    shutil.copy2(tmp_path, cfg.db_path)
-    await dbm.init_db(cfg.db_path)  # ensure schema exists (if older db)
-    await update.message.reply_text("✅ Restore done. (Old DB backed up as backups/pre_restore_backup.sqlite3)")
-    return ConversationHandler.END
-
-
-async def cmd_allclear_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
-
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
-        await update.message.reply_text("⛔ Admin only.")
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "<b>⚠️ ALL CLEAR</b>\n"
-        "Data အားလုံးကို အပြီးတိုင်ဖျက်မယ်။ ဆက်လုပ်ချင်ရင်\n\n"
-        "<code>YES_DELETE_ALL</code>\n\n"
-        "လို့ ပြန်ပို့ပါ။"
-    )
-    return ALLCLEAR_CONFIRM
-
-
-async def cmd_allclear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg: Cfg = context.bot_data["cfg"]
-    if (update.message.text or "").strip() != "YES_DELETE_ALL":
-        await update.message.reply_text("Cancelled.")
-        return ConversationHandler.END
-
-    # backup before delete
-    if os.path.exists(cfg.db_path):
-        os.makedirs("backups", exist_ok=True)
-        shutil.copy2(cfg.db_path, os.path.join("backups", "pre_allclear_backup.sqlite3"))
-
-    # remove db and recreate
-    try:
-        os.remove(cfg.db_path)
-    except Exception:
-        pass
-
-    await dbm.init_db(cfg.db_path)
-    await update.message.reply_text("✅ All data cleared. (Backup saved: backups/pre_allclear_backup.sqlite3)")
-    return ConversationHandler.END
-
-
-async def cmd_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    cfg: Cfg = context.bot_data["cfg"]
-    await ensure_user(cfg, update)
-
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
+    if not is_admin(cfg, update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return ConversationHandler.END
 
     await update.message.reply_text(
         "<b>📣 Broadcast</b>\n"
-        "အခု message တစ်ခု (စာ/ပုံ/စတစ်ကာ မဟုတ်ပဲ စာ/ပုံ လုံလောက်) ပို့ပါ။\n"
-        "Bot က အဲဒီ message ကို users အားလုံးထံ copy ပို့ပေးမယ်။\n\n"
+        "အခု message တစ်ခု (စာ/ပုံ) ပို့ပါ။\n"
+        "Bot က users အားလုံးထံ copy ပို့ပေးပါမယ်။\n\n"
         "Cancel: /cancel"
     )
-    return BC_WAIT_MESSAGE
+    return BROADCAST_WAIT
 
 
 async def cmd_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cfg: Cfg = context.bot_data["cfg"]
-    if not is_admin(update.effective_user.id, cfg.admin_ids):
+    if not is_admin(cfg, update.effective_user.id):
         return ConversationHandler.END
 
-    user_ids = await dbm.get_all_user_ids(cfg.db_path)
+    user_ids = await all_user_ids(cfg)
     if not user_ids:
         await update.message.reply_text("Users မရှိသေးပါ။")
         return ConversationHandler.END
@@ -694,72 +1104,241 @@ async def cmd_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE)
     sent = 0
     failed = 0
 
-    src_chat_id = update.effective_chat.id
-    src_msg_id = update.message.message_id
+    src_chat = update.effective_chat.id
+    src_msg = update.message.message_id
 
     await update.message.reply_text(f"Sending to <b>{len(user_ids)}</b> users...")
 
     for uid in user_ids:
         try:
-            await context.bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_msg_id)
+            await context.bot.copy_message(chat_id=uid, from_chat_id=src_chat, message_id=src_msg)
             sent += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.05)  # small throttling
+        await asyncio.sleep(0.05)
 
-    await dbm.log_action(cfg.db_path, update.effective_user.id, "admin_broadcast", f"sent={sent},failed={failed}")
-    await update.message.reply_text(f"✅ Broadcast done.\n• Sent: <b>{sent}</b>\n• Failed: <b>{failed}</b>")
+    await log_action(cfg, update.effective_user.id, "admin_broadcast", f"sent={sent},failed={failed}")
+    await update.message.reply_text(f"✅ Done.\n• Sent: <b>{sent}</b>\n• Failed: <b>{failed}</b>")
     return ConversationHandler.END
 
 
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Cancelled.")
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Cfg = context.bot_data["cfg"]
+    await upsert_user(cfg, update)
+
+    if not is_admin(cfg, update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    s = await stats(cfg)
+    await update.message.reply_text(
+        "<b>📊 Bot Stats</b>\n"
+        f"• Total users: <b>{s['total_users']}</b>\n"
+        f"• Active (24h): <b>{s['active_24h']}</b>\n"
+        f"• Active (7d): <b>{s['active_7d']}</b>\n"
+    )
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Cfg = context.bot_data["cfg"]
+    await upsert_user(cfg, update)
+
+    if not is_admin(cfg, update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not os.path.exists(cfg.db_path):
+        await update.message.reply_text("DB file မတွေ့ပါ။")
+        return
+
+    os.makedirs("backups", exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_name = f"backup_{ts}.sqlite3"
+    dst = os.path.join("backups", backup_name)
+
+    def _copy() -> None:
+        shutil.copy2(cfg.db_path, dst)
+
+    await asyncio.to_thread(_copy)
+
+    with open(dst, "rb") as f:
+        await update.message.reply_document(document=f, filename=backup_name, caption="✅ Backup created.")
+
+
+async def cmd_restore_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Cfg = context.bot_data["cfg"]
+    await upsert_user(cfg, update)
+
+    if not is_admin(cfg, update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "<b>♻️ Restore Database</b>\n"
+        "SQLite DB file (.sqlite3/.db/.sqlite) ကို upload လုပ်ပါ။\n"
+        "⚠️ Restore လုပ်တာနဲ့ လက်ရှိ DB ကို အရင် backup ထုတ်ပြီး အစားထိုးပါမယ်။\n\n"
+        "Cancel: /cancel"
+    )
+    return RESTORE_WAIT
+
+
+async def cmd_restore_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Cfg = context.bot_data["cfg"]
+    if not is_admin(cfg, update.effective_user.id):
+        return ConversationHandler.END
+
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("DB file upload လုပ်ပါ။")
+        return RESTORE_WAIT
+
+    fn = doc.file_name or ""
+    if not fn.endswith((".sqlite3", ".db", ".sqlite")):
+        await update.message.reply_text("❌ File type မမှန်ပါ။ .sqlite3/.db/.sqlite ဖြစ်ရမယ်။")
+        return RESTORE_WAIT
+
+    os.makedirs("restore_tmp", exist_ok=True)
+    tmp_path = os.path.join("restore_tmp", fn)
+
+    f = await doc.get_file()
+    await f.download_to_drive(custom_path=tmp_path)
+
+    # backup current
+    if os.path.exists(cfg.db_path):
+        os.makedirs("backups", exist_ok=True)
+        shutil.copy2(cfg.db_path, os.path.join("backups", "pre_restore_backup.sqlite3"))
+
+    shutil.copy2(tmp_path, cfg.db_path)
+    await init_db(cfg.db_path)  # ensure tables exist
+
+    await update.message.reply_text("✅ Restore done. (Backup saved: backups/pre_restore_backup.sqlite3)")
     return ConversationHandler.END
 
 
-# ---------------- Main ----------------
+async def cmd_allclear_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Cfg = context.bot_data["cfg"]
+    await upsert_user(cfg, update)
 
-def load_config() -> Cfg:
+    if not is_admin(cfg, update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "<b>⚠️ ALL CLEAR</b>\n"
+        "Data အားလုံးကို အပြီးတိုင် ဖျက်ပစ်မယ်။ ဆက်လုပ်ချင်ရင် အောက်က စာသားကို ပြန်ပို့ပါ:\n\n"
+        "<code>YES_DELETE_ALL</code>\n\n"
+        "Cancel: /cancel"
+    )
+    return ALLCLEAR_WAIT
+
+
+async def cmd_allclear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Cfg = context.bot_data["cfg"]
+    if not is_admin(cfg, update.effective_user.id):
+        return ConversationHandler.END
+
+    if (update.message.text or "").strip() != "YES_DELETE_ALL":
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    if os.path.exists(cfg.db_path):
+        os.makedirs("backups", exist_ok=True)
+        shutil.copy2(cfg.db_path, os.path.join("backups", "pre_allclear_backup.sqlite3"))
+        try:
+            os.remove(cfg.db_path)
+        except Exception:
+            pass
+
+    await init_db(cfg.db_path)
+    await update.message.reply_text("✅ All data cleared. (Backup saved: backups/pre_allclear_backup.sqlite3)")
+    return ConversationHandler.END
+
+
+def normalize_delete_type(token: str) -> Optional[str]:
+    t = token.strip().upper()
+    if t in {"A&V", "AV", "AANDV"}:
+        return "AV"
+    if t in {"VOCA", "VOCAB", "VOCABULARY"}:
+        return "VOCA"
+    if t in {"GRAM", "GRAMMAR"}:
+        return "GRAM"
+    if t in {"QUIZ"}:
+        return "QUIZ"
+    return None
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Cfg = context.bot_data["cfg"]
+    await upsert_user(cfg, update)
+
+    if not is_admin(cfg, update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <type>\nTypes: AV | VOCA | GRAM | QUIZ")
+        return
+
+    ctype = normalize_delete_type(context.args[0])
+    if not ctype:
+        await update.message.reply_text("❌ Unknown type. Use: AV|VOCA|GRAM|QUIZ")
+        return
+
+    if ctype == "QUIZ":
+        n = await delete_quiz_all(cfg)
+        await log_action(cfg, update.effective_user.id, "admin_delete_quiz_all", f"count={n}")
+        await update.message.reply_text(f"✅ Deleted quiz questions: <b>{n}</b>")
+        return
+
+    n = await delete_contents_by_type(cfg, ctype)
+    await log_action(cfg, update.effective_user.id, "admin_delete_content_type", f"type={ctype},count={n}")
+    await update.message.reply_text(f"✅ Deleted contents ({ctype}): <b>{n}</b>")
+
+
+# =========================
+# MAIN
+# =========================
+
+async def post_init(app: Application) -> None:
+    cfg: Cfg = app.bot_data["cfg"]
+    await init_db(cfg.db_path)
+
+
+def load_cfg() -> Tuple[Cfg, str]:
     load_dotenv()
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("BOT_TOKEN is missing in .env")
 
+    db_path = os.getenv("DATABASE_PATH", "learning_language.sqlite3").strip()
+
     admin_raw = os.getenv("ADMIN_IDS", "").strip()
-    admin_ids = set()
+    admins: set[int] = set()
     for part in admin_raw.split(","):
         part = part.strip()
         if part:
             try:
-                admin_ids.add(int(part))
+                admins.add(int(part))
             except Exception:
                 pass
 
-    db_path = os.getenv("DATABASE_PATH", "learning_language.sqlite3").strip()
-    return Cfg(db_path=db_path, admin_ids=admin_ids)
-
-
-async def post_init(app: Application) -> None:
-    cfg: Cfg = app.bot_data["cfg"]
-    await dbm.init_db(cfg.db_path)
+    return Cfg(db_path=db_path, admin_ids=admins), token
 
 
 def main() -> None:
-    cfg = load_config()
+    cfg, token = load_cfg()
 
     defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
     app = (
         ApplicationBuilder()
-        .token(os.getenv("BOT_TOKEN"))
+        .token(token)
         .defaults(defaults)
         .post_init(post_init)
         .build()
     )
-
     app.bot_data["cfg"] = cfg
 
-    # Learner
+    # Learner commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("profile", cmd_profile))
@@ -770,70 +1349,58 @@ def main() -> None:
     app.add_handler(CommandHandler("cquiz", cmd_cquiz))
     app.add_handler(CommandHandler("tops", cmd_tops))
 
-    # Callbacks
+    # Callback (learner actions + quiz answers)
     app.add_handler(CallbackQueryHandler(on_callback))
 
-    # Admin: /edit provides dashboard; then quick-add via commands below
-    app.add_handler(CommandHandler("edit", cmd_edit))
-    app.add_handler(CommandHandler("giveexp", cmd_giveexp))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-    app.add_handler(CommandHandler("delete", cmd_delete))
+    # Admin conversations: /edit
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("edit", edit_entry)],
+        states={
+            EDIT_MENU: [CallbackQueryHandler(edit_menu_callback, pattern=r"^(admin:|adminlang:).+")],
+            EDIT_WAIT_CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_content)],
+            EDIT_WAIT_QUIZ: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_quiz)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        name="edit_conv",
+        persistent=False,
+    )
+    app.add_handler(edit_conv)
 
-    # Conversations: broadcast / restore / allclear / admin add templates
+    # Admin: broadcast
     broadcast_conv = ConversationHandler(
-        entry_points=[CommandHandler("broadcast", cmd_broadcast_start)],
-        states={BC_WAIT_MESSAGE: [MessageHandler(filters.ALL & ~filters.COMMAND, cmd_broadcast_send)]},
+        entry_points=[CommandHandler("broadcast", cmd_broadcast_entry)],
+        states={BROADCAST_WAIT: [MessageHandler(filters.ALL & ~filters.COMMAND, cmd_broadcast_send)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="broadcast_conv",
         persistent=False,
     )
     app.add_handler(broadcast_conv)
 
+    # Admin: restore
     restore_conv = ConversationHandler(
-        entry_points=[CommandHandler("restore", cmd_restore_start)],
-        states={RESTORE_WAIT_FILE: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, cmd_restore_receive_file)]},
+        entry_points=[CommandHandler("restore", cmd_restore_entry)],
+        states={RESTORE_WAIT: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, cmd_restore_receive)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="restore_conv",
         persistent=False,
     )
     app.add_handler(restore_conv)
 
+    # Admin: allclear
     allclear_conv = ConversationHandler(
-        entry_points=[CommandHandler("allclear", cmd_allclear_start)],
-        states={ALLCLEAR_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_allclear_confirm)]},
+        entry_points=[CommandHandler("allclear", cmd_allclear_entry)],
+        states={ALLCLEAR_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_allclear_confirm)]},
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         name="allclear_conv",
         persistent=False,
     )
     app.add_handler(allclear_conv)
 
-    # Admin quick add: use /addav /addvoca /addgram /addquiz to open template (optional shortcut)
-    addav = ConversationHandler(
-        entry_points=[CommandHandler("addav", lambda u, c: admin_add_content_template(u, c, "AV"))],
-        states={BC_WAIT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_parse_and_save)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-    addvoca = ConversationHandler(
-        entry_points=[CommandHandler("addvoca", lambda u, c: admin_add_content_template(u, c, "VOCA"))],
-        states={BC_WAIT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_parse_and_save)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-    addgram = ConversationHandler(
-        entry_points=[CommandHandler("addgram", lambda u, c: admin_add_content_template(u, c, "GRAM"))],
-        states={BC_WAIT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_parse_and_save)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-    addquiz = ConversationHandler(
-        entry_points=[CommandHandler("addquiz", lambda u, c: admin_add_content_template(u, c, "QUIZ"))],
-        states={BC_WAIT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_parse_and_save)]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-    )
-
-    app.add_handler(addav)
-    app.add_handler(addvoca)
-    app.add_handler(addgram)
-    app.add_handler(addquiz)
+    # Admin normal commands
+    app.add_handler(CommandHandler("giveexp", cmd_giveexp))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("delete", cmd_delete))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
